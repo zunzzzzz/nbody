@@ -1,0 +1,8 @@
+rule cxx
+    command = g++ -std=c++11 -O3 $in -o $out
+
+rule nvcc
+    command = nvcc -std=c++11 -O3 $in -o $out
+
+build hw5: nvcc hw5.cu
+build nbody: cxx nbody.cc
