@@ -1,2 +1,6 @@
 nbody.cc
 *.py
+.ninja*
+hw5
+nbody
+*.out
