@@ -63,16 +63,17 @@ __global__
 void run_step(int step, int n, double* qx, double* qy,
     double* qz, double* vx, double* vy,
     double* vz, double* m,
-    int* type) 
+    int* type, double *ax, double *ay, double *az) 
 {
     int index = threadIdx.x + blockIdx.x * blockDim.x;
     int stride = blockDim.x * gridDim.x;
-    printf("%d qx[0] %f\n", index, qx[0]);
+    for (int i = index; i < n; i += stride) {
+        ax[i] = 0;
+        ay[i] = 0;
+        az[i] = 0;
+    }
+    __syncthreads();
     // compute accelerations
-    double *ax, *ay, *az;
-    ax = new double[n]();
-    ay = new double[n]();
-    az = new double[n]();
     for (int i = index; i < n; i += stride) {
         for (int j = 0; j < n; j++) {
             if (j == i) continue;
@@ -85,33 +86,28 @@ void run_step(int step, int n, double* qx, double* qy,
             double dx = qx[j] - qx[i];
             double dy = qy[j] - qy[i];
             double dz = qz[j] - qz[i];
-            double dist3 =
-                pow(dx * dx + dy * dy + dz * dz + param::eps * param::eps, 1.5);
-            ax[i] += param::G * mj * dx / dist3;
-            ay[i] += param::G * mj * dy / dist3;
-            az[i] += param::G * mj * dz / dist3;
+            // double dist3 = pow(dx * dx + dy * dy + dz * dz + param::eps * param::eps, 1.5);
+            double dist3 = pow(dx * dx + dy * dy + dz * dz + 1e-3 * 1e-3, 1.5);
+            ax[i] += 6.674e-11 * mj * dx / dist3;
+            ay[i] += 6.674e-11 * mj * dy / dist3;
+            az[i] += 6.674e-11 * mj * dz / dist3;
         }
     }
     __syncthreads();
     // update velocities
     for (int i = index; i < n; i += stride) {
-        vx[i] += ax[i] * param::dt;
-        vy[i] += ay[i] * param::dt;
-        vz[i] += az[i] * param::dt;
-        
+        vx[i] += ax[i] * 60;
+        vy[i] += ay[i] * 60;
+        vz[i] += az[i] * 60;
     }
     __syncthreads();
     // update positions
     for (int i = index; i < n; i += stride) {
-        qx[i] += vx[i] * param::dt;
-        qy[i] += vy[i] * param::dt;
-        qz[i] += vz[i] * param::dt;
+        qx[i] += vx[i] * 60;
+        qy[i] += vy[i] * 60;
+        qz[i] += vz[i] * 60;
     }
     __syncthreads();
-    
-    delete(ax);
-    delete(ay);
-    delete(az);
 }
 int main(int argc, char** argv) {
     if (argc != 3) {
@@ -119,7 +115,7 @@ int main(int argc, char** argv) {
     }
     int n, planet, asteroid, count = 0;
     double *qx, *qy, *qz, *vx, *vy, *vz, *m;
-    double *qx_gpu, *qy_gpu, *qz_gpu, *vx_gpu, *vy_gpu, *vz_gpu, *m_gpu;
+    double *qx_gpu, *qy_gpu, *qz_gpu, *vx_gpu, *vy_gpu, *vz_gpu, *m_gpu, *ax, *ay, *az;
     int* type; // 1 for device 0 for non-device
     int* type_gpu; // 1 for device 0 for non-device
     clock_t t1, t2;
@@ -148,6 +144,9 @@ int main(int argc, char** argv) {
     cudaMalloc(&vz_gpu, n * sizeof(double));
     cudaMalloc(&m_gpu, n * sizeof(double));
     cudaMalloc(&type_gpu, n * sizeof(int));
+    cudaMalloc(&ax, n * sizeof(double));
+    cudaMalloc(&ay, n * sizeof(double));
+    cudaMalloc(&az, n * sizeof(double));
     for (int i = 0; i < n; i++) {
         if (type[i] == 1) {
             m[i] = 0;
@@ -164,7 +163,7 @@ int main(int argc, char** argv) {
             cudaMemcpy(vz_gpu, vz, n * sizeof(double), cudaMemcpyHostToDevice);
             cudaMemcpy(m_gpu, m, n * sizeof(double), cudaMemcpyHostToDevice);
             cudaMemcpy(type_gpu, type, n * sizeof(int), cudaMemcpyHostToDevice);
-            run_step<<<num_of_blocks, threads_per_block>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu);
+            run_step<<<num_of_blocks, threads_per_block>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu, ax, ay, az);
             cudaMemcpy(qx, qx_gpu, n * sizeof(double), cudaMemcpyDeviceToHost);
             cudaMemcpy(qy, qy_gpu, n * sizeof(double), cudaMemcpyDeviceToHost);
             cudaMemcpy(qz, qz_gpu, n * sizeof(double), cudaMemcpyDeviceToHost);
@@ -300,5 +299,8 @@ int main(int argc, char** argv) {
     cudaFree(vz_gpu);
     cudaFree(m_gpu);
     cudaFree(type_gpu);
+    cudaFree(ax);
+    cudaFree(ay);
+    cudaFree(az);
     return 0;
 }
