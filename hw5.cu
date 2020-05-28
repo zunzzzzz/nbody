@@ -9,18 +9,22 @@
 #include <vector>
 #include <time.h>
 __device__ double min_dist_gpu;
-__device__ bool is_hit_gpu = false;
 __device__ double target_distance_gpu;
+__device__ double missel_travel_distance_gpu;
+__device__ double time_gpu;
+__device__ bool is_hit_gpu = false;
+__device__ bool is_explode_gpu = false;
+__device__ int hit_time_step_gpu = -2;
 namespace param {
     const int n_steps = 200000;
-    const double dt = 60;
-    const double eps = 1e-3;
-    const double G = 6.674e-11;
+    // const double dt = 60;
+    // const double eps = 1e-3;
+    // const double G = 6.674e-11;
     double gravity_device_mass(double m0, double t) {
         return m0 + 0.5 * m0 * fabs(sin(t / 6000));
     }
-    const double planet_radius = 1e7;
-    const double missile_speed = 1e6;
+    // const double planet_radius = 1e7;
+    // const double missile_speed = 1e6;
     double get_missile_cost(double t) { return 1e5 + 1e3 * t; }
 }  // namespace param
 void read_input(const char* filename, int& n, int& planet, int& asteroid,
@@ -121,14 +125,31 @@ void calculate_missle_distance(int planet, int device, double* qx, double* qy, d
     target_distance_gpu = sqrt(dx * dx + dy * dy + dz * dz);
 }
 __global__
-void calculate_hit(int planet, int asteroid, double* qx, double* qy, double* qz)
+void calculate_hit(int step, int planet, int asteroid, double* qx, double* qy, double* qz)
 {
     double dx = qx[planet] - qx[asteroid];
     double dy = qy[planet] - qy[asteroid];
     double dz = qz[planet] - qz[asteroid];
-    if(sqrt(dx * dx + dy * dy + dz * dz) < 1e7) {
+    if(sqrt(dx * dx + dy * dy + dz * dz) < 1e7 && is_hit_gpu == false) {
         is_hit_gpu = true;
+        hit_time_step_gpu = step;
         printf("hit\n");
+    }
+}
+__global__
+void calculate_target_distance(int planet, int device, double* qx, double* qy, double* qz, double* m)
+{
+    if(is_explode_gpu == false) {
+        missel_travel_distance_gpu += 1e6 * 60;
+        time_gpu += 60;
+        double dx = qx[planet] - qx[device];
+        double dy = qy[planet] - qy[device];
+        double dz = qz[planet] - qz[device];
+        target_distance_gpu = sqrt(dx * dx + dy * dy + dz * dz);
+        if (missel_travel_distance_gpu > target_distance_gpu) {
+            is_explode_gpu = true;
+            m[device] = 0;
+        }
     }
 }
 __global__
@@ -147,7 +168,8 @@ void run_step(int step, int n, double* qx, double* qy,
     double* qz, double* vx, double* vy,
     double* vz, double* m,
     int* type, double *ax, double *ay, double *az) 
-{
+{   
+    // blockDim means block size, gridDim means number of blocks
     int index = threadIdx.x + blockIdx.x * blockDim.x;
     int stride = blockDim.x * gridDim.x;
     for (int i = index; i < n; i += stride) {
@@ -157,26 +179,30 @@ void run_step(int step, int n, double* qx, double* qy,
     }
     __syncthreads();
     // compute accelerationsn
-    for (int i = blockIdx.x; i < n; i += stride) {
-        for (int j = threadIdx.x; j < n; j += blockDim.x) {
-            double mj = m[j];
-            if (type[j] == 1) {
-                mj = mj + 0.5 * mj * fabs(sin((double) (step * 60) / (double)6000));
+
+    int i = blockIdx.x;
+    int j = threadIdx.x;
+    for(i = blockIdx.x; i < n; i += gridDim.x) {
+        for(j = threadIdx.x; j < n; j+= blockDim.x) {
+            if(i != j) {
+                double mj = m[j];
+                if (type[j] == 1) {
+                    mj = mj + 0.5 * mj * fabs(sin((double) (step * 60) / (double)6000));
+                }
+                double dx = qx[j] - qx[i];
+                double dy = qy[j] - qy[i];
+                double dz = qz[j] - qz[i];
+                double dist3 = pow(dx * dx + dy * dy + dz * dz + 1e-3 * 1e-3, 1.5);
+
+                atomicAdd(&ax[i], 6.674e-11 * mj * dx / dist3);
+                atomicAdd(&ay[i], 6.674e-11 * mj * dy / dist3);
+                atomicAdd(&az[i], 6.674e-11 * mj * dz / dist3);
+
             }
-            double dx = qx[j] - qx[i];
-            double dy = qy[j] - qy[i];
-            double dz = qz[j] - qz[i];
-            double dist3 = pow(dx * dx + dy * dy + dz * dz + 1e-3 * 1e-3, 1.5);
-            // ax[i] += 6.674e-11 * mj * dx / dist3;
-            // ay[i] += 6.674e-11 * mj * dy / dist3;
-            // az[i] += 6.674e-11 * mj * dz / dist3;
-            atomicAdd(&ax[i], 6.674e-11 * mj * dx / dist3);
-            atomicAdd(&ay[i], 6.674e-11 * mj * dy / dist3);
-            atomicAdd(&az[i], 6.674e-11 * mj * dz / dist3);
         }
     }
+
     __syncthreads();
-    // if(index == 0) printf("%e\n", ax[0]);
     // update velocities
     for (int i = index; i < n; i += stride) {
         vx[i] += ax[i] * 60;
@@ -201,8 +227,7 @@ int main(int argc, char** argv) {
     int* type; // 1 for device 0 for non-device
     int* type_gpu; // 1 for device 0 for non-device
     clock_t t1, t2;
-    size_t threads_per_block = 256;
-    size_t num_of_blocks = 32 * 20;
+
 
     int device_id;
     cudaGetDevice(&device_id);
@@ -213,11 +238,13 @@ int main(int argc, char** argv) {
     std::cout << num_of_SMs << std::endl;
 
 
-
+   
     // Problem 1
     t1 = clock();
     double min_dist = std::numeric_limits<double>::infinity();
     read_input(argv[1], n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, type);
+    size_t threads_per_block = 32;
+    size_t num_of_blocks = n / 2;
     // allocate memory
     cudaMalloc(&qx_gpu, n * sizeof(double));
     cudaMalloc(&qy_gpu, n * sizeof(double));
@@ -244,13 +271,11 @@ int main(int argc, char** argv) {
     set_mass<<<num_of_blocks, threads_per_block>>>(m_gpu, type_gpu, n);
     for (int step = 0; step <= param::n_steps; step++) {
         if (step > 0) {
-            // run_step<<<num_of_blocks, threads_per_block>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu, ax, ay, az);
-            run_step<<<n, n>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu, ax, ay, az);
+            run_step<<<num_of_blocks, threads_per_block>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu, ax, ay, az);
         }
         calculate_min<<<1, 1>>>(planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
     }
     cudaMemcpyFromSymbol(&min_dist, min_dist_gpu, sizeof(double), 0, cudaMemcpyDeviceToHost);
-    cudaDeviceSynchronize();
     t2 = clock();
     std::cout << "min_dist " << min_dist << std::endl;
     std::cout << "Problem 1 cost " << (double)((t2 - t1) / CLOCKS_PER_SEC) << " seconds" << std::endl;
@@ -268,17 +293,11 @@ int main(int argc, char** argv) {
     cudaMemcpy(type_gpu, type, n * sizeof(int), cudaMemcpyHostToDevice);
     for (int step = 0; step <= param::n_steps; step++) {
         if (step > 0) {
-            // run_step<<<num_of_blocks, threads_per_block>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu, ax, ay, az);
-            run_step<<<n, n>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu, ax, ay, az);
+            run_step<<<num_of_blocks, threads_per_block>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu, ax, ay, az);
         }
-        calculate_hit<<<1, 1>>>(planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
-        cudaMemcpyFromSymbol(&is_hit, is_hit_gpu, sizeof(bool), 0, cudaMemcpyDeviceToHost);
-        if(is_hit) {
-            hit_time_step = step;
-            break;
-        }
+        calculate_hit<<<1, 1>>>(step, planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
     }
-    cudaDeviceSynchronize();
+    cudaMemcpyFromSymbol(&hit_time_step, hit_time_step_gpu, sizeof(int), 0, cudaMemcpyDeviceToHost);
     t2 = clock();
     std::cout << "hit_time_step " << hit_time_step << std::endl;
     std::cout << "Problem 2 cost " << (double)((t2 - t1) / CLOCKS_PER_SEC) << " seconds" << std::endl;
@@ -302,6 +321,12 @@ int main(int argc, char** argv) {
         }
         for(int iter = 0; iter < device_index.size(); iter++) {
             // initialize
+            double tmp = m[device_index[iter]];
+            double time = 0;
+            int hit_time_step_p3 = -2;
+            is_hit = false; // initialize to false
+            missel_travel_distance = 0;
+            is_explode = false;
             cudaMemcpy(qx_gpu, qx, n * sizeof(double), cudaMemcpyHostToDevice);
             cudaMemcpy(qy_gpu, qy, n * sizeof(double), cudaMemcpyHostToDevice);
             cudaMemcpy(qz_gpu, qz, n * sizeof(double), cudaMemcpyHostToDevice);
@@ -310,48 +335,30 @@ int main(int argc, char** argv) {
             cudaMemcpy(vz_gpu, vz, n * sizeof(double), cudaMemcpyHostToDevice);
             cudaMemcpy(m_gpu, m, n * sizeof(double), cudaMemcpyHostToDevice);
             cudaMemcpy(type_gpu, type, n * sizeof(int), cudaMemcpyHostToDevice);
-            double tmp = m[device_index[iter]];
-            double time = 0;
-            is_hit = false; // initialize to false
+            cudaMemcpyToSymbol(hit_time_step_gpu, &hit_time_step_p3, sizeof(int), 0, cudaMemcpyHostToDevice);
+            cudaMemcpyToSymbol(missel_travel_distance_gpu, &missel_travel_distance, sizeof(double), 0, cudaMemcpyHostToDevice);
+            cudaMemcpyToSymbol(time_gpu, &time, sizeof(double), 0, cudaMemcpyHostToDevice);
+            cudaMemcpyToSymbol(is_explode_gpu, &is_explode, sizeof(bool), 0, cudaMemcpyHostToDevice);
             cudaMemcpyToSymbol(is_hit_gpu, &is_hit, sizeof(bool), 0, cudaMemcpyHostToDevice);
-            missel_travel_distance = 0;
-            is_explode = false;
-            int step = 0;
-            for (step = 0; step <= param::n_steps; step++) {
+            for (int step = 0; step <= param::n_steps; step++) {
                 if (step > 0) {
-                    // run_step<<<num_of_blocks, threads_per_block>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu, ax, ay, az);
-                    run_step<<<n, n>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu, ax, ay, az);
+                    run_step<<<num_of_blocks, threads_per_block>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu, ax, ay, az);
                 }
-                // std::cout << "step " << step << std::endl;
-                calculate_hit<<<1, 1>>>(planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
-                cudaMemcpyFromSymbol(&is_hit, is_hit_gpu, sizeof(bool), 0, cudaMemcpyDeviceToHost);
-                // break for loop if asteroid hit the planet
-                if(is_hit) {
-                    is_saved = false;
-                    break;
-                }
-                if(is_explode == false) {
-                    missel_travel_distance += param::missile_speed * param::dt;
-                    time += param::dt;
-                    double target_distance;
-                    calculate_missle_distance<<<1, 1>>>(planet, device_index[iter], qx_gpu, qy_gpu, qz_gpu);
-                    cudaMemcpyFromSymbol(&target_distance, target_distance_gpu, sizeof(double), 0, cudaMemcpyDeviceToHost);
-                    if (missel_travel_distance > target_distance) {
-                        is_explode = true;
-                        m[device_index[iter]] = 0;
-                        cudaMemcpy(&m_gpu[device_index[iter]], &m[device_index[iter]], sizeof(double), cudaMemcpyHostToDevice);
-                    }
-                }
+                calculate_hit<<<1, 1>>>(step, planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
+                calculate_target_distance<<<1, 1>>>(planet, device_index[iter], qx_gpu, qy_gpu, qz_gpu, m_gpu);
             }
-            if(step == param::n_steps + 1) {
+            cudaMemcpyFromSymbol(&hit_time_step_p3, hit_time_step_gpu, sizeof(int), 0, cudaMemcpyDeviceToHost);
+            cudaMemcpyFromSymbol(&time, time_gpu, sizeof(double), 0, cudaMemcpyDeviceToHost);
+            if(hit_time_step_p3 == -2) {
                 is_saved = true;
+                printf("SAFE\n");
                 double cost = param::get_missile_cost(time);
                 if(cost < missile_cost) {
                     missile_cost = cost;
                     gravity_device_id = device_index[iter];
                 }
             }
-            m[device_index[iter]] = tmp;
+            // m[device_index[iter]] = tmp;
         }
         if(!is_saved) {
             gravity_device_id = -1;
