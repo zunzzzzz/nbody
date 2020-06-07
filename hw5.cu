@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <vector>
 #include <time.h>
+#include <pthread.h>
 __device__ double min_dist_gpu;
 __device__ double target_distance_gpu;
 __device__ double missel_travel_distance_gpu;
@@ -21,15 +22,17 @@ __device__ int hit_time_step_p3_gpu = -2;
 __device__ int gravity_device_id_gpu;
 namespace param {
     const int n_steps = 200000;
-    double gravity_device_mass(double m0, double t) {
-        return m0 + 0.5 * m0 * fabs(sin(t / 6000));
-    }
-    double get_missile_cost(double t) { return 1e5 + 1e3 * t; }
 }  // namespace param
+class Missile{
+public:
+    int index;
+    double cost;
+    char* file_name;
+};
 void read_input(const char* filename, int& n, int& planet, int& asteroid,
     double*& qx, double*& qy, double*& qz,
     double*& vx, double*& vy, double*& vz,
-    double*& m, int*& type) 
+    double*& m, bool*& is_device) 
 {
     std::ifstream fin(filename);
     std::string tmp_type;
@@ -41,19 +44,19 @@ void read_input(const char* filename, int& n, int& planet, int& asteroid,
     vy = new double[n];
     vz = new double[n];
     m = new double[n];
-    type = new int[n];
+    is_device = new bool[n];
     for (int i = 0; i < n; i++) {
         fin >> qx[i] >> qy[i] >> qz[i] >> vx[i] >> vy[i] >> vz[i] >> m[i] >> tmp_type;
         if(tmp_type == "device") {
-            type[i] = 1;
+            is_device[i] = true;
         }
         else {
-            type[i] = 0;
+            is_device[i] = false;
         }
     }
 }
-void free_memory(double*& qx, double*& qy, double*& qz, double*& vx, double*& vy, double*& vz, double*& m, int*& type,
-                double*& qx_gpu, double*& qy_gpu, double*& qz_gpu, double*& vx_gpu, double*& vy_gpu, double*& vz_gpu, double*& m_gpu, int*& type_gpu) 
+void free_memory(double*& qx, double*& qy, double*& qz, double*& vx, double*& vy, double*& vz, double*& m, bool*& is_device,
+                double*& qx_gpu, double*& qy_gpu, double*& qz_gpu, double*& vx_gpu, double*& vy_gpu, double*& vz_gpu, double*& m_gpu, bool*& is_device_gpu) 
 {
     delete(qx);
     delete(qy);
@@ -62,7 +65,7 @@ void free_memory(double*& qx, double*& qy, double*& qz, double*& vx, double*& vy
     delete(vy);
     delete(vz);
     delete(m);
-    delete(type); 
+    delete(is_device); 
     cudaFree(qx_gpu);
     cudaFree(qy_gpu);
     cudaFree(qz_gpu);
@@ -70,7 +73,7 @@ void free_memory(double*& qx, double*& qy, double*& qz, double*& vx, double*& vy
     cudaFree(vy_gpu);
     cudaFree(vz_gpu);
     cudaFree(m_gpu);
-    cudaFree(type_gpu);
+    cudaFree(is_device_gpu);
 }
 void write_output(const char* filename, double min_dist, int hit_time_step,
     int gravity_device_id, double missile_cost) 
@@ -112,20 +115,11 @@ void calculate_min(int planet, int asteroid, double* qx, double* qy, double* qz)
     min_dist_gpu = min(min_dist_gpu, sqrt(dx * dx + dy * dy + dz * dz));
 }
 __global__
-void calculate_missle_distance(int planet, int device, double* qx, double* qy, double* qz)
-{
-    double dx = qx[planet] - qx[device];
-    double dy = qy[planet] - qy[device];
-    double dz = qz[planet] - qz[device];
-    target_distance_gpu = sqrt(dx * dx + dy * dy + dz * dz);
-}
-__global__
-void calculate_missle_cost(double time, int device)
+void calculate_missle_cost(int device)
 {
     if(hit_time_step_p3_gpu == -2) {
         is_saved_gpu = true;
-        printf("SAFE\n");
-        double cost = 1e5 + 1e3 * time;
+        double cost = 1e5 + 1e3 * time_gpu;
         if(cost < missile_cost_gpu) {
             missile_cost_gpu = cost;
             gravity_device_id_gpu = device;
@@ -141,7 +135,6 @@ void calculate_hit(int step, int planet, int asteroid, double* qx, double* qy, d
     if(sqrt(dx * dx + dy * dy + dz * dz) < 1e7 && is_hit_gpu == false) {
         is_hit_gpu = true;
         hit_time_step_gpu = step;
-        printf("hit\n");
     }
 }
 __global__
@@ -153,7 +146,6 @@ void calculate_hit_p3(int step, int planet, int asteroid, double* qx, double* qy
     if(sqrt(dx * dx + dy * dy + dz * dz) < 1e7 && is_hit_gpu == false) {
         is_hit_gpu = true;
         hit_time_step_p3_gpu = step;
-        printf("hit\n");
     }
 }
 __global__
@@ -182,41 +174,35 @@ void p3_init()
     is_hit_gpu = false;
 }
 __global__
-void set_mass(double* m, int* type, int n)
+void set_mass(double* m, bool* is_device, int n)
 {
     int index = threadIdx.x + blockIdx.x * blockDim.x;
     int stride = blockDim.x * gridDim.x;
     for (int i = index; i < n; i += stride) {
-        if (type[i] == 1) {
-            m[i] = 0;
-        }
+        if (is_device[i]) m[i] = 0;
     }
 }
 __global__
 void run_step(int step, const int n, double* qx, double* qy,
     double* qz, double* vx, double* vy,
     double* vz, double* m,
-    int* type) 
+    bool* is_device) 
 {   
     // blockDim means block size, gridDim means number of blocks
-    // int index = threadIdx.x + blockIdx.x * blockDim.x;
-    // int stride = blockDim.x * gridDim.x;
-    __shared__ double ax;
-    __shared__ double ay;
-    __shared__ double az;
-
+    __shared__ double ax, ay, az;
     if(threadIdx.x == 0) { 
         ax = 0;
         ay = 0;
         az = 0;
     }
+    __syncthreads();
     // compute accelerationsn
     for(int i = blockIdx.x; i < n; i += gridDim.x) {
         for(int j = threadIdx.x; j < n; j += blockDim.x) {
             if(i != j) {
                 double mj = m[j];
-                if (type[j] == 1) {
-                    mj = mj + 0.5 * mj * fabs(sin((double) (step * 60) / (double)6000));
+                if (is_device[j]) {
+                    mj = mj + 0.5 * mj * fabs(sin((double) (step) / (double)100));
                 }
                 double dx = qx[j] - qx[i];
                 double dy = qy[j] - qy[i];
@@ -230,7 +216,7 @@ void run_step(int step, const int n, double* qx, double* qy,
         }
     }
     __syncthreads();
-    // update velocities
+    // // update velocities
     if(threadIdx.x == 0) { 
         vx[blockIdx.x] += ax * 60;
         vy[blockIdx.x] += ay * 60;
@@ -243,28 +229,32 @@ void run_step(int step, const int n, double* qx, double* qy,
         qz[blockIdx.x] += vz[blockIdx.x] * 60;
     }
 }
+void* p3(void* missle_data_passed);
 int main(int argc, char** argv) {
     if (argc != 3) {
         throw std::runtime_error("must supply 2 arguments");
     }
     int n, planet, asteroid;
     double *qx, *qy, *qz, *vx, *vy, *vz, *m;
-    int* type; // 1 for device 0 for non-device
+    bool* is_device; 
     // gpu pointer
     double *qx_gpu, *qy_gpu, *qz_gpu, *vx_gpu, *vy_gpu, *vz_gpu, *m_gpu;
-    int *type_gpu; // 1 for device 0 for non-device
+    bool *is_device_gpu; 
     // gpu variable
-    cudaStream_t stream;
-    cudaStreamCreate (&stream) ;
     size_t threads_per_block, num_of_blocks;
 
+    // problem 3 using pthread
+    Missile missile_data;
+    missile_data.file_name = argv[1];
+    pthread_t t; 
+    pthread_create(&t, NULL, p3, (void*) &missile_data); 
 
     // Problem 1
+    cudaSetDevice(0);
     double min_dist = std::numeric_limits<double>::infinity();
-    read_input(argv[1], n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, type);
+    read_input(argv[1], n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, is_device);
     threads_per_block = n;
     num_of_blocks = n;
-    cudaSetDevice(0);
     // allocate memory
     cudaMalloc(&qx_gpu, n * sizeof(double));
     cudaMalloc(&qy_gpu, n * sizeof(double));
@@ -273,40 +263,29 @@ int main(int argc, char** argv) {
     cudaMalloc(&vy_gpu, n * sizeof(double));
     cudaMalloc(&vz_gpu, n * sizeof(double));
     cudaMalloc(&m_gpu, n * sizeof(double));
-    cudaMalloc(&type_gpu, n * sizeof(int));
+    cudaMalloc(&is_device_gpu, n * sizeof(bool));
     // copy memory to gpu
     cudaMemcpy(qx_gpu, qx, n * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(qy_gpu, qy, n * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(qz_gpu, qz, n * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(vx_gpu, vx, n * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(vy_gpu, vy, n * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(vz_gpu, vz, n * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(m_gpu, m, n * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(type_gpu, type, n * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(vz_gpu, vz, n * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(is_device_gpu, is_device, n * sizeof(bool), cudaMemcpyHostToDevice);
     cudaMemcpyToSymbol(min_dist_gpu, &min_dist, sizeof(double), 0, cudaMemcpyHostToDevice);
     // set device mass to zero
-    set_mass<<<num_of_blocks, threads_per_block>>>(m_gpu, type_gpu, n);
+    set_mass<<<num_of_blocks, threads_per_block>>>(m_gpu, is_device_gpu, n);
     for (int step = 0; step <= param::n_steps; step++) {
         if (step > 0) {
-            run_step<<<num_of_blocks, threads_per_block>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu);
+            run_step<<<num_of_blocks, threads_per_block, 0>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, is_device_gpu);
         }
-        calculate_min<<<1, 1>>>(planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
+        calculate_min<<<1, 1, 0>>>(planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
     }
-    // copy gpu variable back to cpu
     cudaMemcpyFromSymbol(&min_dist, min_dist_gpu, sizeof(double), 0, cudaMemcpyDeviceToHost);
-    std::cout << "min_dist " << min_dist << std::endl;
+    std::cout << min_dist << std::endl;
     // Problem 2
     int hit_time_step = -2;
-    cudaSetDevice(1);
-    // allocate memory
-    cudaMalloc(&qx_gpu, n * sizeof(double));
-    cudaMalloc(&qy_gpu, n * sizeof(double));
-    cudaMalloc(&qz_gpu, n * sizeof(double));
-    cudaMalloc(&vx_gpu, n * sizeof(double));
-    cudaMalloc(&vy_gpu, n * sizeof(double));
-    cudaMalloc(&vz_gpu, n * sizeof(double));
-    cudaMalloc(&m_gpu, n * sizeof(double));
-    cudaMalloc(&type_gpu, n * sizeof(int));
     // copy memory to gpu
     cudaMemcpy(qx_gpu, qx, n * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(qy_gpu, qy, n * sizeof(double), cudaMemcpyHostToDevice);
@@ -315,69 +294,96 @@ int main(int argc, char** argv) {
     cudaMemcpy(vy_gpu, vy, n * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(vz_gpu, vz, n * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(m_gpu, m, n * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(type_gpu, type, n * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(is_device_gpu, is_device, n * sizeof(bool), cudaMemcpyHostToDevice);
     for (int step = 0; step <= param::n_steps; step++) {
         if (step > 0) {
-            run_step<<<num_of_blocks, threads_per_block>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu);
+            run_step<<<num_of_blocks, threads_per_block, 0>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, is_device_gpu);
         }
-        calculate_hit<<<1, 1>>>(step, planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
+        calculate_hit<<<1, 1, 0>>>(step, planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
     }
     cudaMemcpyFromSymbol(&hit_time_step, hit_time_step_gpu, sizeof(int), 0, cudaMemcpyDeviceToHost);
-    std::cout << "hit_time_step " << hit_time_step << std::endl;
-    // Problem 3
-    std::vector<int> device_index; // use to iterate all device
-    int gravity_device_id = -999;
-    bool is_saved = false;
-    double missile_cost = std::numeric_limits<double>::infinity();
-    // if planet is safe (hit_time_step == -2), then no need to calculate 
+    // if planet is safe (hit_time_step == -2)
+    pthread_join(t, NULL); 
     if(hit_time_step == -2) {
-        gravity_device_id = -1;
-        missile_cost = 0;
+        // gravity_device_id = -1;
+        // missile_cost = 0;
+        missile_data.index = -1;
+        missile_data.cost = 0;
     }
-    else {
-        for(int iter = 0; iter < n; iter++) {
-            if (type[iter] == 1) {
-                device_index.push_back(iter);
-            }
-        }
-        for(int iter = 0; iter < device_index.size(); iter++) {
-            // initialize
-            double time = 0;
-            int hit_time_step_p3 = -2;
-            cudaMemcpy(qx_gpu, qx, n * sizeof(double), cudaMemcpyHostToDevice);
-            cudaMemcpy(qy_gpu, qy, n * sizeof(double), cudaMemcpyHostToDevice);
-            cudaMemcpy(qz_gpu, qz, n * sizeof(double), cudaMemcpyHostToDevice);
-            cudaMemcpy(vx_gpu, vx, n * sizeof(double), cudaMemcpyHostToDevice);
-            cudaMemcpy(vy_gpu, vy, n * sizeof(double), cudaMemcpyHostToDevice);
-            cudaMemcpy(vz_gpu, vz, n * sizeof(double), cudaMemcpyHostToDevice);
-            cudaMemcpy(m_gpu, m, n * sizeof(double), cudaMemcpyHostToDevice);
-            cudaMemcpy(type_gpu, type, n * sizeof(int), cudaMemcpyHostToDevice);
-            cudaMemcpyToSymbol(gravity_device_id_gpu, &gravity_device_id, sizeof(int), 0, cudaMemcpyHostToDevice);
-            cudaMemcpyToSymbol(missile_cost_gpu, &missile_cost, sizeof(double), 0, cudaMemcpyHostToDevice);
-            p3_init<<<1, 1>>>();
-            for (int step = 0; step <= param::n_steps; step++) {
-                if (step > 0) {
-                    run_step<<<num_of_blocks, threads_per_block>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu);
-                }
-                calculate_hit_p3<<<1, 1>>>(step, planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
-                calculate_target_distance<<<1, 1>>>(planet, device_index[iter], qx_gpu, qy_gpu, qz_gpu, m_gpu);
-            }
-            cudaMemcpyFromSymbol(&hit_time_step_p3, hit_time_step_p3_gpu, sizeof(int), 0, cudaMemcpyDeviceToHost);
-            cudaMemcpyFromSymbol(&time, time_gpu, sizeof(double), 0, cudaMemcpyDeviceToHost);
-            calculate_missle_cost<<<1, 1>>>(time, device_index[iter]);
-            cudaMemcpyFromSymbol(&missile_cost, missile_cost_gpu, sizeof(double), 0, cudaMemcpyDeviceToHost);
-            cudaMemcpyFromSymbol(&gravity_device_id, gravity_device_id_gpu, sizeof(int), 0, cudaMemcpyDeviceToHost);
-        }
-        cudaMemcpyFromSymbol(&is_saved, is_saved_gpu, sizeof(bool), 0, cudaMemcpyDeviceToHost);
-        if(!is_saved) {
-            gravity_device_id = -1;
-            missile_cost = 0;
-        }
-    }
-    std::cout << "gravity_device_id " << gravity_device_id << std::endl;
-    std::cout << "missile_cost " << missile_cost << std::endl;
-    write_output(argv[2], min_dist, hit_time_step, gravity_device_id, missile_cost);
+    // write_output(argv[2], min_dist, hit_time_step, gravity_device_id, missile_cost);
+    write_output(argv[2], min_dist, hit_time_step, missile_data.index, missile_data.cost);
     // free memory
-    free_memory(qx, qy, qz, vx, vy, vz, m, type, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, type_gpu);
+    free_memory(qx, qy, qz, vx, vy, vz, m, is_device, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, is_device_gpu);
     return 0;
+}
+void* p3(void* missle_data_passed) {
+    cudaSetDevice(1);
+    int n, planet, asteroid;
+    double *qx, *qy, *qz, *vx, *vy, *vz, *m;
+    bool* is_device; 
+    // gpu pointer
+    double *qx_gpu, *qy_gpu, *qz_gpu, *vx_gpu, *vy_gpu, *vz_gpu, *m_gpu;
+    bool *is_device_gpu;
+    // gpu variable
+    size_t threads_per_block, num_of_blocks;
+
+    Missile* missle_data_tmp = (Missile*) missle_data_passed;
+    missle_data_tmp -> cost = std::numeric_limits<double>::infinity();
+    missle_data_tmp -> index = -999;
+
+    read_input(missle_data_tmp->file_name, n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, is_device);
+    threads_per_block = n;
+    num_of_blocks = n;
+    cudaMalloc(&qx_gpu, n * sizeof(double));
+    cudaMalloc(&qy_gpu, n * sizeof(double));
+    cudaMalloc(&qz_gpu, n * sizeof(double));
+    cudaMalloc(&vx_gpu, n * sizeof(double));
+    cudaMalloc(&vy_gpu, n * sizeof(double));
+    cudaMalloc(&vz_gpu, n * sizeof(double));
+    cudaMalloc(&m_gpu, n * sizeof(double));
+    cudaMalloc(&is_device_gpu, n * sizeof(bool));
+
+    std::vector<int> device_index; // use to iterate all device
+    bool is_saved = false;
+    // record device index
+    for(int iter = 0; iter < n; iter++) {
+        if (is_device[iter]) {
+            device_index.push_back(iter);
+        }
+    }
+    cudaMemcpyToSymbol(missile_cost_gpu, &(missle_data_tmp -> cost), sizeof(double), 0, cudaMemcpyHostToDevice);
+    for(int iter = 0; iter < device_index.size(); iter++) {
+        // initialize
+        cudaMemcpy(qx_gpu, qx, n * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(qy_gpu, qy, n * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(qz_gpu, qz, n * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(vx_gpu, vx, n * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(vy_gpu, vy, n * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(vz_gpu, vz, n * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(m_gpu, m, n * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(is_device_gpu, is_device, n * sizeof(bool), cudaMemcpyHostToDevice);
+        p3_init<<<1, 1>>>();
+        for (int step = 0; step <= 200000; step++) {
+            if (step > 0) {
+                run_step<<<num_of_blocks, threads_per_block, 0>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, is_device_gpu);
+                cudaError_t err;
+                err = cudaGetLastError(); // `cudaGetLastError` will return the error from above.
+                if (err != cudaSuccess)
+                {
+                    printf("Error: %s\n", cudaGetErrorString(err));
+                }
+            }
+            calculate_hit_p3<<<1, 1, 0>>>(step, planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
+            calculate_target_distance<<<1, 1, 0>>>(planet, device_index[iter], qx_gpu, qy_gpu, qz_gpu, m_gpu);
+        }
+        calculate_missle_cost<<<1, 1, 0>>>(device_index[iter]);
+    }
+    cudaMemcpyFromSymbol(&(missle_data_tmp -> cost), missile_cost_gpu, sizeof(double), 0, cudaMemcpyDeviceToHost);
+    cudaMemcpyFromSymbol(&(missle_data_tmp -> index), gravity_device_id_gpu, sizeof(int), 0, cudaMemcpyDeviceToHost);
+    cudaMemcpyFromSymbol(&is_saved, is_saved_gpu, sizeof(bool), 0, cudaMemcpyDeviceToHost);
+    if(!is_saved) {
+        (missle_data_tmp -> index) = -1;
+        (missle_data_tmp -> cost) = 0;
+    }
+    pthread_exit(NULL);
 }

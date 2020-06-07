@@ -1,8 +1,9 @@
 rule cxx
-    command = g++ -std=c++11 -O3 $in -o $out
+    command = g++ -std=c++11 -lpthread -O3 $in -o $out
 
 rule nvcc
-    command = nvcc -std=c++11 -O3 $in -o $out
+    command = nvcc -std=c++11 -O3 $in -o $out -default-stream per-thread
 
 build hw5: nvcc hw5.cu
 build nbody: cxx nbody.cc
+build test: nvcc test.cu
