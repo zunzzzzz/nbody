@@ -85,27 +85,6 @@ void write_output(const char* filename, double min_dist, int hit_time_step,
          << hit_time_step << '\n'
          << gravity_device_id << ' ' << missile_cost << '\n';
 }
-// define atomic add in device
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
-#else
-__device__ double atomicAdd(double* address, double val)
-{
-    unsigned long long int* address_as_ull =
-                              (unsigned long long int*)address;
-    unsigned long long int old = *address_as_ull, assumed;
-
-    do {
-        assumed = old;
-        old = atomicCAS(address_as_ull, assumed,
-                        __double_as_longlong(val +
-                               __longlong_as_double(assumed)));
-
-    // Note: uses integer comparison to avoid hang in case of NaN (since NaN != NaN)
-    } while (assumed != old);
-
-    return __longlong_as_double(old);
-}
-#endif
 __global__
 void calculate_min(int planet, int asteroid, double* qx, double* qy, double* qz)
 {
@@ -189,18 +168,11 @@ void run_step(int step, const int n, double* qx, double* qy,
     bool* is_device) 
 {   
     // blockDim means block size, gridDim means number of blocks
-    __shared__ double vx_tmp, vy_tmp, vz_tmp;
-    __shared__ double vx_share, vy_share, vz_share;
-    double vx_pri, vy_pri, vz_pri;
-    if(threadIdx.x == 0) { 
-        vx_tmp = vx[blockIdx.x];
-        vy_tmp = vy[blockIdx.x];
-        vz_tmp = vz[blockIdx.x];
-        // vx_share = vx[blockIdx.x];
-        // vy_share = vy[blockIdx.x];
-        // vz_share = vz[blockIdx.x];
-    }
-    __syncthreads();
+    // __shared__ double vx_tmp, vy_tmp, vz_tmp;
+    extern __shared__ double v[];
+    double *vx_share = v;
+    double *vy_share = (double*)&vx_share[n];
+    double *vz_share = (double*)&vy_share[n];     
     // compute accelerationsn
     if(blockIdx.x != threadIdx.x) {
         double mj = m[threadIdx.x];
@@ -212,32 +184,45 @@ void run_step(int step, const int n, double* qx, double* qy,
         double dz = qz[threadIdx.x] - qz[blockIdx.x];
         double dist3 = pow(dx * dx + dy * dy + dz * dz + 1e-6, 1.5);
 
-        atomicAdd(&vx_tmp, 60. * (6.674e-11 * mj * dx / dist3));
-        atomicAdd(&vy_tmp, 60. * (6.674e-11 * mj * dy / dist3));
-        atomicAdd(&vz_tmp, 60. * (6.674e-11 * mj * dz / dist3));
-
-        // vx_pri = 60. * (6.674e-11 * mj * dx / dist3);
-        // vy_pri = 60. * (6.674e-11 * mj * dy / dist3);
-        // vz_pri = 60. * (6.674e-11 * mj * dz / dist3);
+        vx_share[threadIdx.x] = 60. * (6.674e-11 * mj * dx / dist3);
+        vy_share[threadIdx.x] = 60. * (6.674e-11 * mj * dy / dist3);
+        vz_share[threadIdx.x] = 60. * (6.674e-11 * mj * dz / dist3);
     }
-    // atomicAdd(&vx_share, vx_pri);
-    // atomicAdd(&vy_share, vy_pri);
-    // atomicAdd(&vz_share, vz_pri);
+    else {
+        vx_share[threadIdx.x] = 0;
+        vy_share[threadIdx.x] = 0;
+        vz_share[threadIdx.x] = 0;
+    }
     __syncthreads();
+    // accumulate all velocity to thread index 0
+    for(unsigned int s = 1; s < blockDim.x; s *= 2) {
+        if (threadIdx.x % (2 * s) == 0 && ((threadIdx.x + s) < blockDim.x)) {
+            vx_share[threadIdx.x] += vx_share[threadIdx.x + s];
+            vy_share[threadIdx.x] += vy_share[threadIdx.x + s];
+            vz_share[threadIdx.x] += vz_share[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
     // update positions
     if(threadIdx.x == 0) { 
-        qx[blockIdx.x] += vx_tmp * 60;    
-        qy[blockIdx.x] += vy_tmp * 60;
-        qz[blockIdx.x] += vz_tmp * 60;
-        vx[blockIdx.x] = vx_tmp;
-        vy[blockIdx.x] = vy_tmp;
-        vz[blockIdx.x] = vz_tmp;
-        // qx[blockIdx.x] += vx_share * 60;    
-        // qy[blockIdx.x] += vy_share * 60;
-        // qz[blockIdx.x] += vz_share * 60;
-        // vx[blockIdx.x] = vx_share;
-        // vy[blockIdx.x] = vy_share;
-        // vz[blockIdx.x] = vz_share;
+        vx_share[0] += vx[blockIdx.x];
+        vy_share[0] += vy[blockIdx.x];
+        vz_share[0] += vz[blockIdx.x];
+
+        qx[blockIdx.x] += vx_share[0] * 60;    
+        qy[blockIdx.x] += vy_share[0] * 60;
+        qz[blockIdx.x] += vz_share[0] * 60;
+
+        vx[blockIdx.x] = vx_share[0];
+        vy[blockIdx.x] = vy_share[0];
+        vz[blockIdx.x] = vz_share[0];
+        // qx[blockIdx.x] += vx_tmp * 60;    
+        // qy[blockIdx.x] += vy_tmp * 60;
+        // qz[blockIdx.x] += vz_tmp * 60;
+        // vx[blockIdx.x] = vx_tmp;
+        // vy[blockIdx.x] = vy_tmp;
+        // vz[blockIdx.x] = vz_tmp;
     }
 }
 void* p3(void* missile_data_passed) {
@@ -289,7 +274,7 @@ void* p3(void* missile_data_passed) {
         p3_init<<<1, 1>>>();
         for (int step = 0; step <= 200000; step++) {
             if (step > 0) {
-                run_step<<<num_of_blocks, threads_per_block, 0>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, is_device_gpu);
+                run_step<<<num_of_blocks, threads_per_block, 3 * n * sizeof(double)>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, is_device_gpu);
                 cudaError_t err;
                 err = cudaGetLastError(); // `cudaGetLastError` will return the error from above.
                 if (err != cudaSuccess)
@@ -359,7 +344,7 @@ int main(int argc, char** argv) {
     set_mass<<<num_of_blocks, threads_per_block>>>(m_gpu, is_device_gpu, n);
     for (int step = 0; step <= param::n_steps; step++) {
         if (step > 0) {
-            run_step<<<num_of_blocks, threads_per_block, 0>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, is_device_gpu);
+            run_step<<<num_of_blocks, threads_per_block, 3 * n * sizeof(double)>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, is_device_gpu);
         }
         calculate_min<<<1, 1, 0>>>(planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
     }
@@ -378,9 +363,9 @@ int main(int argc, char** argv) {
     cudaMemcpy(is_device_gpu, is_device, n * sizeof(bool), cudaMemcpyHostToDevice);
     for (int step = 0; step <= param::n_steps; step++) {
         if (step > 0) {
-            run_step<<<num_of_blocks, threads_per_block, 0>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, is_device_gpu);
+            run_step<<<num_of_blocks, threads_per_block, 3 * n * sizeof(double)>>>(step, n, qx_gpu, qy_gpu, qz_gpu, vx_gpu, vy_gpu, vz_gpu, m_gpu, is_device_gpu);
         }
-        calculate_hit<<<1, 1, 0>>>(step, planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
+        calculate_hit<<<1, 1>>>(step, planet, asteroid, qx_gpu, qy_gpu, qz_gpu);
     }
     cudaMemcpyFromSymbol(&hit_time_step, hit_time_step_gpu, sizeof(int), 0, cudaMemcpyDeviceToHost);
     // if planet is safe (hit_time_step == -2)
