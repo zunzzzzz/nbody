@@ -189,55 +189,44 @@ void run_step(int step, const int n, double* qx, double* qy,
     bool* is_device) 
 {   
     // blockDim means block size, gridDim means number of blocks
-    __shared__ double vx_tmp, vy_tmp, vz_tmp;
-    __shared__ double vx_share, vy_share, vz_share;
-    double vx_pri, vy_pri, vz_pri;
+    __shared__ double ax, ay, az;
     if(threadIdx.x == 0) { 
-        vx_tmp = vx[blockIdx.x];
-        vy_tmp = vy[blockIdx.x];
-        vz_tmp = vz[blockIdx.x];
-        // vx_share = vx[blockIdx.x];
-        // vy_share = vy[blockIdx.x];
-        // vz_share = vz[blockIdx.x];
+        ax = 0;
+        ay = 0;
+        az = 0;
     }
     __syncthreads();
     // compute accelerationsn
-    if(blockIdx.x != threadIdx.x) {
-        double mj = m[threadIdx.x];
-        if (is_device[threadIdx.x]) {
-            mj = mj + 0.5 * mj * fabs(sin((double) (step) / (double)100));
+    for(int i = blockIdx.x; i < n; i += gridDim.x) {
+        for(int j = threadIdx.x; j < n; j += blockDim.x) {
+            if(i != j) {
+                double mj = m[j];
+                if (is_device[j]) {
+                    mj = mj + 0.5 * mj * fabs(sin((double) (step) / (double)100));
+                }
+                double dx = qx[j] - qx[i];
+                double dy = qy[j] - qy[i];
+                double dz = qz[j] - qz[i];
+                double dist3 = pow(dx * dx + dy * dy + dz * dz + 1e-6, 1.5);
+
+                atomicAdd(&ax, 6.674e-11 * mj * dx / dist3);
+                atomicAdd(&ay, 6.674e-11 * mj * dy / dist3);
+                atomicAdd(&az, 6.674e-11 * mj * dz / dist3);
+            }
         }
-        double dx = qx[threadIdx.x] - qx[blockIdx.x];
-        double dy = qy[threadIdx.x] - qy[blockIdx.x];
-        double dz = qz[threadIdx.x] - qz[blockIdx.x];
-        double dist3 = pow(dx * dx + dy * dy + dz * dz + 1e-6, 1.5);
-
-        atomicAdd(&vx_tmp, 60. * (6.674e-11 * mj * dx / dist3));
-        atomicAdd(&vy_tmp, 60. * (6.674e-11 * mj * dy / dist3));
-        atomicAdd(&vz_tmp, 60. * (6.674e-11 * mj * dz / dist3));
-
-        // vx_pri = 60. * (6.674e-11 * mj * dx / dist3);
-        // vy_pri = 60. * (6.674e-11 * mj * dy / dist3);
-        // vz_pri = 60. * (6.674e-11 * mj * dz / dist3);
     }
-    // atomicAdd(&vx_share, vx_pri);
-    // atomicAdd(&vy_share, vy_pri);
-    // atomicAdd(&vz_share, vz_pri);
     __syncthreads();
+    // update velocities
+    if(threadIdx.x == 0) { 
+        vx[blockIdx.x] += ax * 60;
+        vy[blockIdx.x] += ay * 60;
+        vz[blockIdx.x] += az * 60;
+    }
     // update positions
     if(threadIdx.x == 0) { 
-        qx[blockIdx.x] += vx_tmp * 60;    
-        qy[blockIdx.x] += vy_tmp * 60;
-        qz[blockIdx.x] += vz_tmp * 60;
-        vx[blockIdx.x] = vx_tmp;
-        vy[blockIdx.x] = vy_tmp;
-        vz[blockIdx.x] = vz_tmp;
-        // qx[blockIdx.x] += vx_share * 60;    
-        // qy[blockIdx.x] += vy_share * 60;
-        // qz[blockIdx.x] += vz_share * 60;
-        // vx[blockIdx.x] = vx_share;
-        // vy[blockIdx.x] = vy_share;
-        // vz[blockIdx.x] = vz_share;
+        qx[blockIdx.x] += vx[blockIdx.x] * 60;    
+        qy[blockIdx.x] += vy[blockIdx.x] * 60;
+        qz[blockIdx.x] += vz[blockIdx.x] * 60;
     }
 }
 void* p3(void* missile_data_passed) {

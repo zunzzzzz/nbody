@@ -6,4 +6,4 @@ rule nvcc
 
 build hw5: nvcc hw5.cu
 build nbody: cxx nbody.cc
-build test: nvcc test.cu
+build hw5_noerror: nvcc hw5_noerror.cu
